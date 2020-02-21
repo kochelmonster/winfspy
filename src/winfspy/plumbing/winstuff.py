@@ -1,4 +1,5 @@
 import enum
+from typing import NamedTuple, Any
 
 from .win32_filetime import dt_to_filetime, filetime_to_dt, filetime_now
 
@@ -7,10 +8,42 @@ from .win32_filetime import dt_to_filetime, filetime_to_dt, filetime_now
 from .bindings import ffi, lib
 
 
-# TODO: should use `lib.LocalFree` to free generated security descriptor at one point
-class SecurityDescriptor:
-    # see https://docs.microsoft.com/fr-fr/windows/desktop/SecAuthZ/security-descriptor-string-format
-    def __init__(self, string_format):
+__all__ = (
+    "dt_to_filetime",
+    "filetime_to_dt",
+    "filetime_now",
+    "SecurityDescriptor",
+    "FILE_ATTRIBUTE",
+    "CREATE_FILE_CREATE_OPTIONS",
+    "NTSTATUS",
+    "nt_success",
+    "nt_information",
+    "nt_warning",
+    "nt_error",
+    "cook_ntstatus",
+    "posix_to_ntstatus",
+    "ntstatus_to_posix",
+)
+
+
+class SecurityDescriptor(NamedTuple):
+
+    handle: Any
+    size: int
+
+    @classmethod
+    def from_cpointer(cls, handle):
+        if handle == ffi.NULL:
+            return cls(ffi.NULL, 0)
+        size = lib.GetSecurityDescriptorLength(handle)
+        pointer = lib.malloc(size)
+        new_handle = ffi.cast("SECURITY_DESCRIPTOR*", pointer)
+        ffi.memmove(new_handle, handle, size)
+        return cls(new_handle, size)
+
+    @classmethod
+    def from_string(cls, string_format):
+        # see https://docs.microsoft.com/fr-fr/windows/desktop/SecAuthZ/security-descriptor-string-format
         psd = ffi.new("SECURITY_DESCRIPTOR**")
         psd_size = ffi.new("ULONG*")
         if not lib.ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -20,9 +53,19 @@ class SecurityDescriptor:
                 f"Cannot create security descriptor `{string_format}`: "
                 f"{cook_ntstatus(lib.GetLastError())}"
             )
-        # assert lib.IsValidSecurityDescriptor(psd[0])
-        self.handle = psd[0]
-        self.size = psd_size[0]
+        return cls(psd[0], psd_size[0])
+
+    def evolve(self, security_information, modification_descriptor):
+        psd = ffi.new("SECURITY_DESCRIPTOR**")
+        lib.FspSetSecurityDescriptor(
+            self.handle, security_information, modification_descriptor, psd
+        )
+        handle = psd[0]
+        size = lib.GetSecurityDescriptorLength(handle)
+        return type(self)(handle, size)
+
+    def is_valid(self):
+        return bool(lib.IsValidSecurityDescriptor(self.handle))
 
     def __del__(self):
         lib.LocalFree(self.handle)
@@ -119,12 +162,14 @@ def nt_error(status):
 
 
 def cook_ntstatus(status):
-    for candidate in NTSTATUS:
-        if candidate.value == status:
-            return candidate
+    try:
+        return NTSTATUS(status)
+    except ValueError:
+        return NTSTATUS.STATUS_UNKNOWN
 
 
-class NTSTATUS(enum.IntEnum):
+class NTSTATUS(enum.IntEnum):  # pragma: no cover
+    STATUS_UNKNOWN = -1
     STATUS_SUCCESS = 0x0
     STATUS_WAIT_0 = 0x0
     STATUS_WAIT_1 = 0x1

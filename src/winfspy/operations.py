@@ -1,33 +1,34 @@
+import sys
+import logging
+import threading
 from typing import List
 from functools import wraps
 
-from .plumbing.winstuff import NTSTATUS
+from .plumbing.winstuff import NTSTATUS, SecurityDescriptor
 from .plumbing.bindings import lib, ffi
 from .exceptions import NTStatusError
 
 
-if False:
-    import logging
-    import _thread
-    logger = logging.getLogger('winftpy')
+logger = logging.getLogger("winfspy")
 
-    def debug_spy(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            ident = _thread.get_ident()
-            logger.debug("----> %X: %r(%r, %r)", ident, fn.__name__, args, kwargs)
-            try:
-                result = fn(*args, **kwargs)
-            except BaseException as e:
-                logger.exception("---- Error %r: %r", fn.__name__, e)
-                raise
-            logger.debug("<---- %X: %r -> %r", ident, fn.__name__, result)
-            return result
 
-        return wrapper
-else:
-    def debug_spy(fn):
-        return fn
+def _catch_unhandled_exceptions(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if sys.gettrace() != threading._trace_hook:
+            sys.settrace(threading._trace_hook)
+        try:
+            return fn(*args, **kwargs)
+
+        except BaseException:
+            logger.exception("Unhandled exception")
+            return NTSTATUS.STATUS_UNEXPECTED_IO_ERROR
+
+    return wrapper
+
+
+# Because `encode('UTF16')` appends a BOM a the begining of the output
+_STRING_ENCODING = "UTF-16-LE" if sys.byteorder == "little" else "UTF-16-BE"
 
 
 class BaseFileContext:
@@ -52,7 +53,7 @@ class BaseFileSystemOperations:
 
     # ~~~ GET_VOLUME_INFO ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_get_volume_info(self, volume_info) -> NTSTATUS:
         """
         Get volume information.
@@ -65,12 +66,15 @@ class BaseFileSystemOperations:
 
         volume_info.TotalSize = vi["total_size"]
         volume_info.FreeSize = vi["free_size"]
-        volume_label = vi["volume_label"]
-        if len(volume_label) > 32:
-            raise ValueError("`volume_label` should be at most 32 characters long !")
-        volume_info.VolumeLabel = volume_label
-        # Stored in WCHAR, so each character should be 2 octets
-        volume_info.VolumeLabelLength = len(volume_label) * 2
+
+        volume_label_encoded = vi["volume_label"].encode(_STRING_ENCODING)
+        if len(volume_label_encoded) > 64:
+            raise ValueError(
+                "`volume_label` should be at most 64 bytes long once encoded in UTF16 !"
+            )
+        ffi.memmove(volume_info.VolumeLabel, volume_label_encoded, len(volume_label_encoded))
+        # The volume label length must be reported in bytes (and without NULL bytes at the end)
+        volume_info.VolumeLabelLength = len(volume_label_encoded)
 
         return NTSTATUS.STATUS_SUCCESS
 
@@ -85,7 +89,7 @@ class BaseFileSystemOperations:
 
     # ~~~ SET_VOLUME_LABEL ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_set_volume_label(self, volume_label, volume_info) -> NTSTATUS:
         """
         Set volume label.
@@ -107,7 +111,7 @@ class BaseFileSystemOperations:
 
     # ~~~ GET_SECURITY_BY_NAME ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_get_security_by_name(
         self,
         file_name,
@@ -133,6 +137,10 @@ class BaseFileSystemOperations:
         # Get file security
         if p_security_descriptor_size != ffi.NULL:
             if sd_size > p_security_descriptor_size[0]:
+                # In case of overflow error, winfsp will retry with a new
+                # allocation based on `p_security_descriptor_size`. Hence we
+                # must update this value to the required size.
+                p_security_descriptor_size[0] = sd_size
                 return NTSTATUS.STATUS_BUFFER_OVERFLOW
             p_security_descriptor_size[0] = sd_size
 
@@ -149,7 +157,7 @@ class BaseFileSystemOperations:
 
     # ~~~ CREATE ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_create(
         self,
         file_name,
@@ -168,7 +176,7 @@ class BaseFileSystemOperations:
 
         # `granted_access` is already handle by winfsp
 
-        # TODO: think about security descriptor handling...
+        security_descriptor = SecurityDescriptor.from_cpointer(security_descriptor)
 
         try:
             cooked_file_context = self.create(
@@ -203,7 +211,7 @@ class BaseFileSystemOperations:
 
     # ~~~ OPEN ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_open(
         self, file_name, create_options, granted_access, p_file_context, file_info
     ) -> NTSTATUS:
@@ -213,9 +221,7 @@ class BaseFileSystemOperations:
         cooked_file_name = ffi.string(file_name)
 
         try:
-            cooked_file_context = self.open(
-                cooked_file_name, create_options, granted_access
-            )
+            cooked_file_context = self.open(cooked_file_name, create_options, granted_access)
 
         except NTStatusError as exc:
             return exc.value
@@ -232,7 +238,7 @@ class BaseFileSystemOperations:
 
     # ~~~ OVERWRITE ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_overwrite(
         self,
         file_context,
@@ -247,10 +253,7 @@ class BaseFileSystemOperations:
         cooked_file_context = ffi.from_handle(file_context)
         try:
             self.overwrite(
-                cooked_file_context,
-                file_attributes,
-                replace_file_attributes,
-                allocation_size
+                cooked_file_context, file_attributes, replace_file_attributes, allocation_size,
             )
 
         except NTStatusError as exc:
@@ -258,16 +261,18 @@ class BaseFileSystemOperations:
 
         return self.ll_get_file_info(file_context, file_info)
 
-    def overwrite(self, file_context) -> None:
+    def overwrite(
+        self, file_context, file_attributes, replace_file_attributes: bool, allocation_size: int,
+    ) -> None:
         raise NotImplementedError()
 
     # ~~~ CLEANUP ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_cleanup(self, file_context, file_name, flags: int) -> None:
         """
-		Cleanup a file.
-		"""
+        Cleanup a file.
+        """
         cooked_file_context = ffi.from_handle(file_context)
         if file_name:
             cooked_file_name = ffi.string(file_name)
@@ -285,11 +290,11 @@ class BaseFileSystemOperations:
 
     # ~~~ CLOSE ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_close(self, file_context) -> None:
         """
-		Close a file.
-		"""
+        Close a file.
+        """
         cooked_file_context = ffi.from_handle(file_context)
         try:
             self.close(cooked_file_context)
@@ -304,10 +309,8 @@ class BaseFileSystemOperations:
 
     # ~~~ READ ~~~
 
-    @debug_spy
-    def ll_read(
-        self, file_context, buffer, offset, length, p_bytes_transferred
-    ) -> NTSTATUS:
+    @_catch_unhandled_exceptions
+    def ll_read(self, file_context, buffer, offset, length, p_bytes_transferred) -> NTSTATUS:
         """
         Read a file.
         """
@@ -328,7 +331,7 @@ class BaseFileSystemOperations:
 
     # ~~~ WRITE ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_write(
         self,
         file_context,
@@ -348,11 +351,7 @@ class BaseFileSystemOperations:
 
         try:
             p_bytes_transferred[0] = self.write(
-                cooked_file_context,
-                cooked_buffer,
-                offset,
-                write_to_end_of_file,
-                constrained_io,
+                cooked_file_context, cooked_buffer, offset, write_to_end_of_file, constrained_io,
             )
 
         except NTStatusError as exc:
@@ -365,7 +364,7 @@ class BaseFileSystemOperations:
 
     # ~~~ FLUSH ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_flush(self, file_context, file_info) -> NTSTATUS:
         """
         Flush a file or volume.
@@ -384,7 +383,7 @@ class BaseFileSystemOperations:
 
     # ~~~ GET_FILE_INFO ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_get_file_info(self, file_context, file_info) -> NTSTATUS:
         """
         Get file or directory information.
@@ -415,7 +414,7 @@ class BaseFileSystemOperations:
 
     # ~~~ SET_BASIC_INFO ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_set_basic_info(
         self,
         file_context,
@@ -471,7 +470,7 @@ class BaseFileSystemOperations:
 
     # ~~~ SET_FILE_SIZE ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_set_file_size(self, file_context, new_size, set_allocation_size, file_info):
         """
         Set file/allocation size.
@@ -479,7 +478,7 @@ class BaseFileSystemOperations:
         cooked_file_context = ffi.from_handle(file_context)
 
         try:
-            ret = self.set_file_size(cooked_file_context, new_size, set_allocation_size)
+            self.set_file_size(cooked_file_context, new_size, set_allocation_size)
 
         except NTStatusError as exc:
             return exc.value
@@ -491,7 +490,7 @@ class BaseFileSystemOperations:
 
     # ~~~ CAN_DELETE ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_can_delete(self, file_context, file_name) -> NTSTATUS:
         """
         Determine whether a file or directory can be deleted.
@@ -511,7 +510,7 @@ class BaseFileSystemOperations:
 
     # ~~~ RENAME ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_rename(self, file_context, file_name, new_file_name, replace_if_exists):
         """
         Renames a file or directory.
@@ -533,17 +532,13 @@ class BaseFileSystemOperations:
 
         return NTSTATUS.STATUS_SUCCESS
 
-    def rename(
-        self, file_context, file_name: str, new_file_name: str, replace_if_exists: bool
-    ):
+    def rename(self, file_context, file_name: str, new_file_name: str, replace_if_exists: bool):
         raise NotImplementedError()
 
     # ~~~ GET_SECURITY ~~~
 
-    @debug_spy
-    def ll_get_security(
-        self, file_context, security_descriptor, p_security_descriptor_size
-    ):
+    @_catch_unhandled_exceptions
+    def ll_get_security(self, file_context, security_descriptor, p_security_descriptor_size):
         """
         Get file or directory security descriptor.
         """
@@ -572,18 +567,14 @@ class BaseFileSystemOperations:
 
     # ~~~ SET_SECURITY ~~~
 
-    @debug_spy
-    def ll_set_security(
-        self, file_context, security_information, modification_descriptor
-    ):
+    @_catch_unhandled_exceptions
+    def ll_set_security(self, file_context, security_information, modification_descriptor):
         """
         Set file or directory security descriptor.
         """
         cooked_file_context = ffi.from_handle(file_context)
         try:
-            self.set_security(
-                cooked_file_context, security_information, modification_descriptor
-            )
+            self.set_security(cooked_file_context, security_information, modification_descriptor)
 
         except NTStatusError as exc:
             return exc.value
@@ -595,10 +586,8 @@ class BaseFileSystemOperations:
 
     # ~~~ READ_DIRECTORY ~~~
 
-    @debug_spy
-    def ll_read_directory(
-        self, file_context, pattern, marker, buffer, length, p_bytes_transferred
-    ):
+    @_catch_unhandled_exceptions
+    def ll_read_directory(self, file_context, pattern, marker, buffer, length, p_bytes_transferred):
         """
         Read a directory.
         """
@@ -619,16 +608,16 @@ class BaseFileSystemOperations:
             # Optimization FTW... FSP_FSCTL_DIR_INFO must be allocated along
             # with it last field (FileNameBuf which is a string)
             file_name = entry_info["file_name"]
-            file_name_size = len(file_name) * 2  # WCHAR string no NULL byte
-            dir_info_size = ffi.sizeof("FSP_FSCTL_DIR_INFO") + file_name_size
+            file_name_encoded = file_name.encode(_STRING_ENCODING)
+            # FSP_FSCTL_DIR_INFO base struct + WCHAR[] string
+            # Note: Windows does not use NULL-terminated string
+            dir_info_size = ffi.sizeof("FSP_FSCTL_DIR_INFO") + len(file_name_encoded)
             dir_info_raw = ffi.new("char[]", dir_info_size)
             dir_info = ffi.cast("FSP_FSCTL_DIR_INFO*", dir_info_raw)
-            dir_info.FileNameBuf = file_name
             dir_info.Size = dir_info_size
+            ffi.memmove(dir_info.FileNameBuf, file_name_encoded, len(file_name_encoded))
             configure_file_info(dir_info.FileInfo, **entry_info)
-            if not lib.FspFileSystemAddDirInfo(
-                dir_info, buffer, length, p_bytes_transferred
-            ):
+            if not lib.FspFileSystemAddDirInfo(dir_info, buffer, length, p_bytes_transferred):
                 return NTSTATUS.STATUS_SUCCESS
 
         lib.FspFileSystemAddDirInfo(ffi.NULL, buffer, length, p_bytes_transferred)
@@ -647,12 +636,19 @@ class BaseFileSystemOperations:
             file_attributes
             allocation_size
             file_size
+
+        Only direct children should be included in this list.
+        The special directories "." and ".." should ONLY be included if the queried directory is not root.
+        The list has to be consistently sorted.
+        The marker argument marks where in the directory to start reading.
+        Files with names that are greater than (not equal to) this marker should be returned.
+        Might be None, in which case the filtering is disabled.
         """
         raise NotImplementedError()
 
     # ~~~ RESOLVE_REPARSE_POINTS ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_resolve_reparse_points(
         self,
         file_name,
@@ -695,7 +691,7 @@ class BaseFileSystemOperations:
 
     # ~~~ GET_REPARSE_POINT ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_get_reparse_point(self, file_context, file_name, buffer, p_size):
         """
         Get reparse point.
@@ -704,9 +700,7 @@ class BaseFileSystemOperations:
         cooked_file_name = ffi.string(file_name)
         # TODO: handle buffer and p_size here
         try:
-            self.get_reparse_point(
-                cooked_file_context, cooked_file_name, buffer, p_size
-            )
+            self.get_reparse_point(cooked_file_context, cooked_file_name, buffer, p_size)
 
         except NTStatusError as exc:
             return exc.value
@@ -718,7 +712,7 @@ class BaseFileSystemOperations:
 
     # ~~~ SET_REPARSE_POINT ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_set_reparse_point(self, file_context, file_name, buffer, size):
         """
         Set reparse point.
@@ -739,18 +733,16 @@ class BaseFileSystemOperations:
 
     # ~~~ DELETE_REPARSE_POINT ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_delete_reparse_point(self, file_context, file_name, buffer, size):
         """
-		Delete reparse point.
-		"""
+        Delete reparse point.
+        """
         cooked_file_context = ffi.from_handle(file_context)
         cooked_file_name = ffi.string(file_name)
         # TODO: handle buffer and size here
         try:
-            self.delete_reparse_point(
-                cooked_file_context, cooked_file_name, buffer, size
-            )
+            self.delete_reparse_point(cooked_file_context, cooked_file_name, buffer, size)
 
         except NTStatusError as exc:
             return exc.value
@@ -762,20 +754,16 @@ class BaseFileSystemOperations:
 
     # ~~~ GET_STREAM_INFO ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_get_stream_info(self, file_context, buffer, length, p_bytes_transferred):
         """
         Get named streams information.
         Must set `volum_params.named_streams` to 1 for this method to be used.
-		"""
-        cooked_file_context = ffi.from_handle(
-            file_context, buffer, length, p_bytes_transferred
-        )
+        """
+        cooked_file_context = ffi.from_handle(file_context, buffer, length, p_bytes_transferred)
         # TODO: handle p_bytes_transferred here
         try:
-            self.get_stream_info(
-                cooked_file_context, buffer, length, p_bytes_transferred
-            )
+            self.get_stream_info(cooked_file_context, buffer, length, p_bytes_transferred)
 
         except NTStatusError as exc:
             return exc.value
@@ -787,28 +775,30 @@ class BaseFileSystemOperations:
 
     # ~~~ GET_DIR_INFO_BY_NAME ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_get_dir_info_by_name(self, file_context, file_name, dir_info):
         """
         Must set `volum_params.pass_query_directory_file_name` to 1 for
-        this method to be used.
-		"""
+        this method to be used. This is the default when an `get_dir_info_by_name`
+        implementation is provided.
+        """
         cooked_file_context = ffi.from_handle(file_context)
         cooked_file_name = ffi.string(file_name)
         try:
-            # TODO handle dir_info here
-            info = self.get_dir_info_by_name(
-                cooked_file_context, cooked_file_name)
+            info = self.get_dir_info_by_name(cooked_file_context, cooked_file_name)
 
         except NTStatusError as exc:
             return exc.value
 
-        # dir_info is already allocated for us, but we have to retreive it
-        # custom size (it is allocated along with it last field)
-        file_name_size = len(cooked_file_name) * 2  # WCHAR string no NULL byte
-        dir_info.Size = ffi.sizeof("FSP_FSCTL_DIR_INFO") + file_name_size
-        dir_info.FileNameBuf = cooked_file_name
+        file_name_bytesize = lib.wcslen(file_name) * 2  # WCHAR
+        ffi.memmove(dir_info.FileNameBuf, file_name, file_name_bytesize)
+
         configure_file_info(dir_info.FileInfo, **info)
+
+        # dir_info is already allocated for us with a 255 wchar buffer for file
+        # name, but we have to set the actual used size here
+        dir_info.Size = ffi.sizeof("FSP_FSCTL_DIR_INFO") + file_name_bytesize
+
         return NTSTATUS.STATUS_SUCCESS
 
     def get_dir_info_by_name(self, file_context, file_name: str) -> dict:
@@ -827,7 +817,7 @@ class BaseFileSystemOperations:
 
     # ~~~ CONTROL ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_control(
         self,
         file_context,
@@ -873,7 +863,7 @@ class BaseFileSystemOperations:
 
     # ~~~ SET_DELETE ~~~
 
-    @debug_spy
+    @_catch_unhandled_exceptions
     def ll_set_delete(self, file_context, file_name, delete_file):
         cooked_file_context = ffi.from_handle(file_context)
         cooked_file_name = ffi.string(file_name)

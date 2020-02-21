@@ -11,6 +11,7 @@ is_64bits = sys.maxsize > 2 ** 32
 BASEDIR = os.path.dirname(os.path.abspath(__file__))
 
 # import `get_winfsp_dir` the violent way given winfspy cannot be loaded yet
+get_winfsp_dir = None
 exec(open(f"{BASEDIR}/../winfspy/plumbing/get_winfsp_dir.py").read())
 WINFSP_DIR = get_winfsp_dir()
 
@@ -42,6 +43,7 @@ ffibuilder.set_source(
     "winfspy.plumbing._bindings",
     """
 #include <windows.h>
+#include <string.h>
 #include <sddl.h>
 #include <strsafe.h>
 #include <winfsp/winfsp.h>
@@ -75,7 +77,7 @@ const int WFSPY_FILE_RESERVE_OPFILTER = FILE_RESERVE_OPFILTER;
 const int WFSPY_FILE_OPEN_REQUIRING_OPLOCK = FILE_OPEN_REQUIRING_OPLOCK;
 const int WFSPY_FILE_COMPLETE_IF_OPLOCKED = FILE_COMPLETE_IF_OPLOCKED;
 
-const int WFSPY_FILE_ATTRIBUTE_INVALID_FILE_ATTRIBUTES = INVALID_FILE_ATTRIBUTES;
+const UINT32 WFSPY_FILE_ATTRIBUTE_INVALID_FILE_ATTRIBUTES = INVALID_FILE_ATTRIBUTES;
 
 
 // Bitfields are not handled with CFFI, hence this big hack...
@@ -109,6 +111,11 @@ void configure_FSP_FSCTL_VOLUME_PARAMS(
     UINT32 um_file_context_is_user_context2,
     UINT32 um_file_context_is_full_context,
     UINT32 um_reserved_flags,
+    UINT32 allow_open_in_kernel_mode,
+    UINT32 case_preserved_extended_attributes,
+    UINT32 wsl_features,
+    UINT32 directory_marker_as_next_offset,
+    UINT32 reject_irp_prior_to_transact0,
     UINT32 km_reserved_flags,
     WCHAR *prefix,
     WCHAR *file_system_name,
@@ -151,6 +158,12 @@ void configure_FSP_FSCTL_VOLUME_PARAMS(
     VolumeParams->UmFileContextIsUserContext2 = um_file_context_is_user_context2;
     VolumeParams->UmFileContextIsFullContext = um_file_context_is_full_context;
     VolumeParams->UmReservedFlags = um_reserved_flags;
+
+    VolumeParams->AllowOpenInKernelMode = allow_open_in_kernel_mode;
+    VolumeParams->CasePreservedExtendedAttributes = case_preserved_extended_attributes;
+    VolumeParams->WslFeatures = wsl_features;
+    VolumeParams->DirectoryMarkerAsNextOffset = directory_marker_as_next_offset;
+    VolumeParams->RejectIrpPriorToTransact0 = reject_irp_prior_to_transact0;
     VolumeParams->KmReservedFlags = km_reserved_flags;
 
     StringCbCopyW(VolumeParams->Prefix, FSP_FSCTL_VOLUME_PREFIX_SIZE / sizeof(WCHAR), prefix);
@@ -244,6 +257,11 @@ void configure_FSP_FSCTL_VOLUME_PARAMS(
     UINT32 um_file_context_is_user_context2,
     UINT32 um_file_context_is_full_context,
     UINT32 um_reserved_flags,
+    UINT32 allow_open_in_kernel_mode,
+    UINT32 case_preserved_extended_attributes,
+    UINT32 wsl_features,
+    UINT32 directory_marker_as_next_offset,
+    UINT32 reject_irp_prior_to_transact0,
     UINT32 km_reserved_flags,
     WCHAR * prefix,
     WCHAR * file_system_name,
@@ -289,6 +307,7 @@ extern const int WFSPY_FILE_COMPLETE_IF_OPLOCKED;
 
 extern const int WFSPY_FILE_ATTRIBUTE_INVALID_FILE_ATTRIBUTES;
 
+size_t wcslen(const wchar_t *str);
 """
 )
 

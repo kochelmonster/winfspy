@@ -31,12 +31,14 @@ def _volume_params_factory(
     pass_query_directory_file_name=0,
     flush_and_purge_on_cleanup=0,
     device_control=0,
-    um_file_context_is_user_context2=1,
-        # for correct handling of file_context in operation.py
-        # um_file_context_is_user_context2 must be 1
-        # (see https://github.com/billziss-gh/winfsp/issues/231)
+    um_file_context_is_user_context2=0,
     um_file_context_is_full_context=0,
     um_reserved_flags=0,
+    allow_open_in_kernel_mode=0,
+    case_preserved_extended_attributes=0,
+    wsl_features=0,
+    directory_marker_as_next_offset=0,
+    reject_irp_prior_to_transact0=0,
     km_reserved_flags=0,
     prefix="",
     file_system_name="",
@@ -81,6 +83,11 @@ def _volume_params_factory(
         um_file_context_is_user_context2,
         um_file_context_is_full_context,
         um_reserved_flags,
+        allow_open_in_kernel_mode,
+        case_preserved_extended_attributes,
+        wsl_features,
+        directory_marker_as_next_offset,
+        reject_irp_prior_to_transact0,
         km_reserved_flags,
         prefix,
         file_system_name,
@@ -101,12 +108,24 @@ class FileSystem:
     def __init__(self, mountpoint, operations, debug=False, **volume_params):
         self.started = False
         if not isinstance(operations, BaseFileSystemOperations):
-            raise ValueError(
-                f"`operations` must be a `BaseFileSystemOperations` instance."
-            )
+            raise ValueError(f"`operations` must be a `BaseFileSystemOperations` instance.")
 
         self.mountpoint = mountpoint
         self.operations = operations
+
+        # The `pass_query_directory_pattern` mode is not supported at the moment
+        if volume_params.get("pass_query_directory_pattern", False):
+            raise ValueError(
+                "The `pass_query_directory_pattern` mode is not supported at the moment"
+            )
+
+        # Enable `pass_query_directory_file_name` by default if `get_dir_info_by_name` is available
+        get_dir_info_by_name_available = (
+            type(operations).get_dir_info_by_name
+            is not BaseFileSystemOperations.get_dir_info_by_name
+        )
+        if get_dir_info_by_name_available and "pass_query_directory_file_name" not in volume_params:
+            volume_params["pass_query_directory_file_name"] = True
 
         self._volume_params = _volume_params_factory(**volume_params)
         set_delete_available = (
@@ -123,34 +142,31 @@ class FileSystem:
             self._file_system_ptr,
         )
         if not nt_success(result):
-            raise WinFSPyError(
-                f"Cannot create file system: {cook_ntstatus(result).name}"
-            )
+            raise WinFSPyError(f"Cannot create file system: {cook_ntstatus(result).name}")
 
         # Avoid GC on the handle
         self._operations_handle = ffi.new_handle(operations)
         self._file_system_ptr[0].UserContext = self._operations_handle
 
         if debug:
-            lib.FspFileSystemSetDebugLogF(self._file_system_ptr[0], 1)
+            lib.FspFileSystemSetDebugLogF(self._file_system_ptr[0], 0xFFFFFFFF)
 
     def start(self):
         if self.started:
             raise FileSystemAlreadyStarted()
         self.started = True
 
-        result = lib.FspFileSystemSetMountPoint(
-            self._file_system_ptr[0], self.mountpoint
-        )
+        result = lib.FspFileSystemSetMountPoint(self._file_system_ptr[0], self.mountpoint)
         if not nt_success(result):
-            raise WinFSPyError(
-                f"Cannot mount file system: {cook_ntstatus(result).name}"
-            )
-        lib.FspFileSystemStartDispatcher(self._file_system_ptr[0], 0)
+            raise WinFSPyError(f"Cannot mount file system: {cook_ntstatus(result).name}")
+        result = lib.FspFileSystemStartDispatcher(self._file_system_ptr[0], 0)
+        if not nt_success(result):
+            raise WinFSPyError(f"Cannot start file system dispatcher: {cook_ntstatus(result).name}")
 
     def stop(self):
         if not self.started:
             raise FileSystemNotStarted()
         self.started = False
 
+        lib.FspFileSystemStopDispatcher(self._file_system_ptr[0])
         lib.FspFileSystemDelete(self._file_system_ptr[0])
